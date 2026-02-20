@@ -65,7 +65,20 @@ export const questProvider: Provider = {
 
     const textParts: string[] = ["## Quest & NPC Status\n"];
 
-    const quests = service.getQuestState?.() || [];
+    interface QuestEntry {
+      name?: string;
+      questId?: string;
+      status?: string;
+      description?: string;
+      stageProgress?: Record<string, string>;
+    }
+    const getter = (service as unknown as Record<string, unknown>)[
+      "getQuestState"
+    ];
+    const quests: QuestEntry[] =
+      typeof getter === "function"
+        ? ((getter.call(service) as QuestEntry[]) ?? [])
+        : [];
 
     if (quests.length > 0) {
       textParts.push("### Active Quests");

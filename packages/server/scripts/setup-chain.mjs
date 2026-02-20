@@ -1,6 +1,6 @@
 import { createPublicClient, http } from "viem";
 import { foundry } from "viem/chains";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -47,7 +47,21 @@ async function isPortInUse(port) {
     });
 }
 
+function isAnvilInstalled() {
+    try {
+        execSync("which anvil", { stdio: "ignore" });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 async function startAnvil() {
+    if (!isAnvilInstalled()) {
+        log("Anvil not installed — skipping blockchain setup. Install Foundry to enable.", colors.yellow);
+        return false;
+    }
+
     log("Anvil is not running. Starting Anvil...", colors.yellow);
 
     const anvil = spawn("anvil", ["--block-time", "1"], {
@@ -63,13 +77,14 @@ async function startAnvil() {
     while (retries < 20) {
         if (await isPortInUse(ANVIL_PORT)) {
             log("Anvil started successfully.", colors.green);
-            return;
+            return true;
         }
         await new Promise((r) => setTimeout(r, 500));
         retries++;
     }
 
-    throw new Error("Failed to start Anvil.");
+    log("Anvil did not start within timeout.", colors.yellow);
+    return false;
 }
 
 function getWorldAddressFromConfig() {
@@ -136,10 +151,18 @@ async function deployContracts() {
 }
 
 async function checkAndSetup() {
+    if (process.env.SKIP_CHAIN_SETUP === "1" || process.env.SKIP_CHAIN_SETUP === "true") {
+        log("Skipping chain setup (SKIP_CHAIN_SETUP=1)", colors.yellow);
+        return;
+    }
     try {
         // 1. Check Anvil
         if (!(await isPortInUse(ANVIL_PORT))) {
-            await startAnvil();
+            const started = await startAnvil();
+            if (!started) {
+                log("Continuing without blockchain integration.", colors.yellow);
+                return;
+            }
         } else {
             log("Anvil is already running.", colors.green);
         }
@@ -180,8 +203,8 @@ async function checkAndSetup() {
         log("Setup complete. Starting server...", colors.green);
 
     } catch (error) {
-        console.error(`${colors.red}Setup failed:${colors.reset}`, error);
-        process.exit(1);
+        log(`Chain setup failed (non-fatal): ${error.message || error}`, colors.yellow);
+        log("Server will start without blockchain integration.", colors.yellow);
     }
 }
 

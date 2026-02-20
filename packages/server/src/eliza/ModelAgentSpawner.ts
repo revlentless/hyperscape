@@ -45,35 +45,19 @@ interface ModelProviderConfig {
  * AI model configurations for agents
  */
 export const MODEL_AGENTS: ModelProviderConfig[] = [
-  // OpenAI Models
+  // OpenAI-compatible models (works with Groq via OPENAI_BASE_URL)
   {
     provider: "openai",
-    model: "gpt-5",
-    displayName: "GPT-5",
+    model: "llama-3.3-70b-versatile",
+    displayName: "Llama 3.3 70B",
     apiKeyEnv: "OPENAI_API_KEY",
     pluginModule: "@elizaos/plugin-openai",
     pluginExport: "openaiPlugin",
   },
   {
     provider: "openai",
-    model: "gpt-5-nano",
-    displayName: "GPT-5 Nano",
-    apiKeyEnv: "OPENAI_API_KEY",
-    pluginModule: "@elizaos/plugin-openai",
-    pluginExport: "openaiPlugin",
-  },
-  {
-    provider: "openai",
-    model: "gpt-4.1",
-    displayName: "GPT-4.1",
-    apiKeyEnv: "OPENAI_API_KEY",
-    pluginModule: "@elizaos/plugin-openai",
-    pluginExport: "openaiPlugin",
-  },
-  {
-    provider: "openai",
-    model: "gpt-4.1-mini",
-    displayName: "GPT-4.1 Mini",
+    model: "llama-3.1-8b-instant",
+    displayName: "Llama 3.1 8B",
     apiKeyEnv: "OPENAI_API_KEY",
     pluginModule: "@elizaos/plugin-openai",
     pluginExport: "openaiPlugin",
@@ -571,6 +555,140 @@ export async function stopAllModelAgents(): Promise<void> {
  */
 export function getAvailableModels(): ModelProviderConfig[] {
   return MODEL_AGENTS.filter((config) => process.env[config.apiKeyEnv]);
+}
+
+/**
+ * Spawn a single model agent by characterId.
+ * Looks up the agent config from the registered MODEL_AGENTS list.
+ * If an agent with the same provider-model key is already running,
+ * it is stopped first (hot-swap behavior for model deployment).
+ *
+ * @returns The RunningAgent entry, or null if spawn failed.
+ */
+export async function spawnSingleModelAgent(
+  world: World,
+  characterId: string,
+): Promise<RunningAgent | null> {
+  // Resolve config from characterId pattern: "agent-{provider}-{model-slug}"
+  const matchingConfig = MODEL_AGENTS.find((cfg) => {
+    const expectedId = `agent-${cfg.provider}-${cfg.model.replace(/[^a-z0-9]/gi, "-").toLowerCase()}`;
+    return expectedId === characterId;
+  });
+
+  if (!matchingConfig) {
+    console.error(
+      `[ModelAgentSpawner] spawnSingleModelAgent: no config found for ${characterId}`,
+    );
+    return null;
+  }
+
+  if (!process.env[matchingConfig.apiKeyEnv]) {
+    console.error(
+      `[ModelAgentSpawner] spawnSingleModelAgent: no API key for ${matchingConfig.displayName}`,
+    );
+    return null;
+  }
+
+  const agentKey = `${matchingConfig.provider}-${matchingConfig.model}`;
+
+  // Stop existing agent if running (hot-swap)
+  if (runningAgents.has(agentKey)) {
+    console.log(
+      `[ModelAgentSpawner] spawnSingleModelAgent: stopping existing ${matchingConfig.displayName} for hot-swap`,
+    );
+    await stopModelAgent(matchingConfig.provider, matchingConfig.model);
+  }
+
+  // Reuse the shared spawning infrastructure
+  const sqlPlugin = await loadSqlPlugin();
+  const databaseSystem = world.getSystem("database") as {
+    getDb?: () => import("drizzle-orm/node-postgres").NodePgDatabase | null;
+  } | null;
+  const db = databaseSystem?.getDb?.();
+
+  if (!db) {
+    console.error(
+      "[ModelAgentSpawner] spawnSingleModelAgent: database not available",
+    );
+    return null;
+  }
+
+  const { characters, users } = await import("../database/schema.js");
+  const { eq } = await import("drizzle-orm");
+
+  const accountId = "model-agents-account";
+  const existingUsers = (await db
+    .select()
+    .from(users)
+    .where(eq(users.id, accountId))) as Array<{ id: string }>;
+  if (existingUsers.length === 0) {
+    await db.insert(users).values({
+      id: accountId,
+      name: "AI Model Agents",
+      roles: "agent",
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  const modelPlugin = await loadModelPlugin(matchingConfig);
+  if (!modelPlugin) return null;
+
+  const existingChars = (await db
+    .select()
+    .from(characters)
+    .where(eq(characters.id, characterId))) as Array<{ id: string }>;
+
+  if (existingChars.length === 0) {
+    await db.insert(characters).values({
+      id: characterId,
+      accountId,
+      name: matchingConfig.displayName,
+      isAgent: 1,
+      createdAt: Date.now(),
+    });
+  }
+
+  const character = createAgentCharacter(matchingConfig);
+  const plugins: Plugin[] = [modelPlugin];
+  if (sqlPlugin) plugins.push(sqlPlugin);
+
+  const runtime = new AgentRuntime({ character, plugins });
+  await runtime.initialize();
+
+  const service = new EmbeddedHyperscapeService(
+    world,
+    characterId,
+    accountId,
+    matchingConfig.displayName,
+  );
+  await service.initialize();
+  startAgentBehaviorLoop(runtime, service, matchingConfig);
+
+  const entry: RunningAgent = {
+    config: matchingConfig,
+    runtime,
+    service,
+    characterId,
+    accountId,
+  };
+  runningAgents.set(agentKey, entry);
+
+  console.log(
+    `[ModelAgentSpawner] spawnSingleModelAgent: spawned ${matchingConfig.displayName}`,
+  );
+  return entry;
+}
+
+/**
+ * Find the running agent entry by characterId.
+ */
+export function getRunningAgentByCharacterId(
+  characterId: string,
+): RunningAgent | null {
+  for (const [, agent] of runningAgents) {
+    if (agent.characterId === characterId) return agent;
+  }
+  return null;
 }
 
 // ============================================================================

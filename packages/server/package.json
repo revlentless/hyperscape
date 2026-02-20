@@ -19,7 +19,8 @@
     "real-time"
   ],
   "scripts": {
-    "dev": "bun scripts/setup-chain.mjs && bun scripts/dev.mjs",
+    "dev": "bun scripts/dev.mjs",
+    "dev:chain": "bun scripts/setup-chain.mjs && bun scripts/dev.mjs",
     "extract-bounds": "bun scripts/extract-model-bounds.ts",
     "build": "bun scripts/build-server.mjs",
     "start": "bun scripts/setup-chain.mjs && bun --preload ./src/shared/polyfills.ts ./dist/index.js",
@@ -55,6 +56,7 @@
     "LICENSE"
   ],
   "dependencies": {
+    "@elizaos/core": "^2.0.0-alpha.2",
     "@elizaos/plugin-sql": "^2.0.0-alpha.2",
     "@fastify/compress": "^8.0.1",
     "@fastify/cors": "^10.0.1",

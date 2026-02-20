@@ -19,6 +19,7 @@ import {
   DeathState,
   EventType,
   PlayerEntity,
+  TICK_DURATION_MS,
   getDuelArenaConfig,
 } from "@hyperscape/shared";
 
@@ -29,6 +30,7 @@ interface NetworkWithSend {
 import { Logger } from "../ServerNetwork/services";
 import { v4 as uuidv4 } from "uuid";
 import { DuelCombatAI } from "../../arena/DuelCombatAI";
+import { DuelTrajectoryRecorder } from "../../arena/DuelTrajectoryRecorder";
 import {
   type StreamingDuelCycle,
   type AgentContestant,
@@ -112,6 +114,9 @@ export class StreamingDuelScheduler {
   /** Per-agent DuelCombatAI instances for LLM-driven combat decisions */
   private combatAIs: Map<string, DuelCombatAI> = new Map();
 
+  /** Per-agent trajectory recorders for training data capture */
+  private trajectoryRecorders: Map<string, DuelTrajectoryRecorder> = new Map();
+
   /** Camera target for streaming viewers */
   private cameraTarget: string | null = null;
 
@@ -126,6 +131,9 @@ export class StreamingDuelScheduler {
 
   /** Scheduler state for state machine */
   private schedulerState: "IDLE" | "WAITING_FOR_AGENTS" | "ACTIVE" = "IDLE";
+
+  /** Last model version hash seen from latest-model.json. Null = never checked. */
+  private lastModelVersionHash: string | null = null;
 
   constructor(world: World) {
     this.world = world;
@@ -1275,28 +1283,74 @@ export class StreamingDuelScheduler {
     const { agent1, agent2 } = this.currentCycle;
 
     const { getAgentManager } = await import("../../eliza/AgentManager.js");
+    const { getRunningAgents } =
+      await import("../../eliza/ModelAgentSpawner.js");
     const manager = getAgentManager();
+    const runningAgents = getRunningAgents();
 
-    const service1 = manager?.getAgentService(agent1.characterId) ?? null;
-    const service2 = manager?.getAgentService(agent2.characterId) ?? null;
+    // Resolve runtime + service for each agent.
+    // ModelAgentSpawner stores both runtime and service keyed by "{provider}-{model}".
+    // We scan by characterId since that's what the scheduler tracks.
+    const resolve = (characterId: string) => {
+      let runtime: import("@elizaos/core").AgentRuntime | null = null;
+      let service:
+        | import("../../eliza/EmbeddedHyperscapeService.js").EmbeddedHyperscapeService
+        | null = null;
+      for (const [, agent] of runningAgents) {
+        if (agent.characterId === characterId) {
+          runtime = agent.runtime;
+          service = agent.service;
+          break;
+        }
+      }
+      if (!service) {
+        service = manager?.getAgentService(characterId) ?? null;
+      }
+      return { runtime, service };
+    };
 
-    if (service1) {
-      const ai1 = new DuelCombatAI(service1, agent2.characterId);
+    const r1 = resolve(agent1.characterId);
+    const r2 = resolve(agent2.characterId);
+
+    // Create trajectory recorders for both agents (same cycleId = same scenarioId)
+    const cycleId = this.currentCycle!.cycleId;
+    this.trajectoryRecorders.clear();
+
+    if (r1.service) {
+      const ai1 = new DuelCombatAI(
+        r1.service,
+        agent2.characterId,
+        { useLlmTactics: !!r1.runtime },
+        r1.runtime ?? undefined,
+      );
+      const recorder1 = new DuelTrajectoryRecorder(agent1.characterId, cycleId);
+      ai1.setOnTick(recorder1.recordTick);
+      this.trajectoryRecorders.set(agent1.characterId, recorder1);
+
       ai1.start();
       this.combatAIs.set(agent1.characterId, ai1);
       Logger.info(
         "StreamingDuelScheduler",
-        `Combat AI started for ${agent1.name}`,
+        `Combat AI started for ${agent1.name} (LLM: ${!!r1.runtime})`,
       );
     }
 
-    if (service2) {
-      const ai2 = new DuelCombatAI(service2, agent1.characterId);
+    if (r2.service) {
+      const ai2 = new DuelCombatAI(
+        r2.service,
+        agent1.characterId,
+        { useLlmTactics: !!r2.runtime },
+        r2.runtime ?? undefined,
+      );
+      const recorder2 = new DuelTrajectoryRecorder(agent2.characterId, cycleId);
+      ai2.setOnTick(recorder2.recordTick);
+      this.trajectoryRecorders.set(agent2.characterId, recorder2);
+
       ai2.start();
       this.combatAIs.set(agent2.characterId, ai2);
       Logger.info(
         "StreamingDuelScheduler",
-        `Combat AI started for ${agent2.name}`,
+        `Combat AI started for ${agent2.name} (LLM: ${!!r2.runtime})`,
       );
     }
   }
@@ -1312,6 +1366,106 @@ export class StreamingDuelScheduler {
       ai.stop();
     }
     this.combatAIs.clear();
+  }
+
+  /** End all trajectory recorders and write JSON files to disk. */
+  private finalizeTrajectories(winnerId: string): void {
+    if (!this.currentCycle) return;
+    const { agent1, agent2 } = this.currentCycle;
+    if (!agent1 || !agent2) return;
+
+    const maxTicks = Math.floor(
+      STREAMING_TIMING.FIGHTING_DURATION / TICK_DURATION_MS,
+    );
+
+    for (const [characterId, recorder] of this.trajectoryRecorders) {
+      const agent = agent1.characterId === characterId ? agent1 : agent2;
+      const stats = this.agentStats.get(characterId) ?? null;
+      const foodStarted = (this.duelFoodSlotsByAgent.get(characterId) ?? [])
+        .length;
+
+      const combatAI = this.combatAIs.get(characterId);
+      const aiStats = combatAI?.getStats();
+
+      recorder.endDuel({
+        won: characterId === winnerId,
+        finalHealthPct:
+          agent.maxHp > 0 ? (agent.currentHp / agent.maxHp) * 100 : 0,
+        damageDealt: agent.damageDealtThisFight,
+        damageReceived: aiStats?.totalDamageReceived ?? 0,
+        foodRemaining: Math.max(0, foodStarted - (aiStats?.healsUsed ?? 0)),
+        foodStarted,
+        tickCount: aiStats?.tickCount ?? 0,
+        maxTicks,
+      });
+    }
+
+    this.trajectoryRecorders.clear();
+  }
+
+  /**
+   * Check for a newly trained model and hot-swap agents if found.
+   *
+   * Looks for a `latest-model.json` file in the trajectory output directory.
+   * Format: { "characterId": "agent-openai-gpt-4o", "modelPath": "/path/to/gguf", "version": "v2", "timestamp": 123456 }
+   *
+   * When a new version is detected (different from lastModelVersionHash),
+   * the target agent is stopped and re-spawned via ModelAgentSpawner.
+   * This happens between duel cycles so combat is never interrupted.
+   */
+  private async checkAndApplyModelUpdates(): Promise<void> {
+    const fs = await import("fs");
+    const path = await import("path");
+
+    const outputDir =
+      process.env.TRAJECTORY_OUTPUT_DIR ??
+      path.resolve(process.cwd(), "training-data-output", "trajectories");
+
+    const manifestPath = path.join(
+      path.dirname(outputDir),
+      "latest-model.json",
+    );
+
+    if (!fs.existsSync(manifestPath)) return;
+
+    const raw = fs.readFileSync(manifestPath, "utf-8");
+    const manifest = JSON.parse(raw) as {
+      characterId: string;
+      modelPath: string;
+      version: string;
+      timestamp: number;
+    };
+
+    // Compute a simple hash to detect changes
+    const versionHash = `${manifest.characterId}:${manifest.version}:${manifest.timestamp}`;
+    if (versionHash === this.lastModelVersionHash) return;
+
+    this.lastModelVersionHash = versionHash;
+
+    Logger.info(
+      "StreamingDuelScheduler",
+      `New model detected: ${manifest.characterId} version ${manifest.version} — restarting agent`,
+    );
+
+    const { spawnSingleModelAgent } =
+      await import("../../eliza/ModelAgentSpawner.js");
+
+    const result = await spawnSingleModelAgent(
+      this.world,
+      manifest.characterId,
+    );
+
+    if (result) {
+      Logger.info(
+        "StreamingDuelScheduler",
+        `Agent ${manifest.characterId} restarted with model version ${manifest.version}`,
+      );
+    } else {
+      Logger.warn(
+        "StreamingDuelScheduler",
+        `Failed to restart agent ${manifest.characterId} — spawn returned null`,
+      );
+    }
   }
 
   /** Set or clear duel flags on agents to prevent normal respawn */
@@ -1679,9 +1833,22 @@ export class StreamingDuelScheduler {
   ): void {
     if (!this.currentCycle) return;
 
-    // Stop the combat loop and combat AIs
+    // Stop combat loop and AI tick timers, then finalize trajectories
+    // (needs stats from the now-stopped AIs while the map is still populated).
     this.stopCombatLoop();
-    this.stopCombatAIs();
+    for (const [, ai] of this.combatAIs) {
+      ai.stop();
+    }
+    this.finalizeTrajectories(winnerId);
+    // Log stats and clear the map (AIs already stopped above)
+    for (const [characterId, ai] of this.combatAIs) {
+      const stats = ai.getStats();
+      Logger.info(
+        "StreamingDuelScheduler",
+        `Combat AI stats for ${characterId}: ${stats.attacksLanded} attacks, ${stats.healsUsed} heals, ${stats.totalDamageDealt} dmg dealt`,
+      );
+    }
+    this.combatAIs.clear();
 
     const now = Date.now();
     this.currentCycle.phase = "RESOLUTION";
@@ -2093,6 +2260,14 @@ export class StreamingDuelScheduler {
 
     // Transition state machine - will be handled by next tick
     this.schedulerState = "IDLE";
+
+    // Check for model updates between cycles (non-blocking)
+    this.checkAndApplyModelUpdates().catch((err) => {
+      Logger.warn(
+        "StreamingDuelScheduler",
+        `Model update check failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
 
     // Start new cycle immediately if we have enough agents
     if (this.availableAgents.size >= config.minAgents) {
